@@ -1,0 +1,187 @@
+#!/bin/bash
+#Fritzbox HAN query and control script. Useful for custom home automation purposes.
+IP="fritz.box"
+sidfile="/tmp/sid.$(whoami).txt"
+
+CMD_LIST=$(echo "getswitchlist\nsetswitchon <ain>\nsetswitchoff <ain>\nsetswitchtoggle <ain>\ngetswitchstate <ain>\n"\
+"getswitchpresent <ain>\ngetswitchpower <ain>\ngetswitchenergy <ain>\ngetswitchname <ain>\ngetdevicelistinfos\n"\
+"gettemperature <ain>\ngethkrtsoll <ain>\ngethkrkomfort <ain>\ngethkrabsenk <ain>\nsethkrtsoll <ain> param=<temp>\n"\
+"getbasicdevicestats <ain>\ngettemplatelistinfos\napplytemplate <ain>\nsetsimpleonoff <ain> onoff=<0-2>\n"\
+"setlevel <ain> level=<0-255>\nsetlevelpercentage <ain> level=<0-100>\n"\
+"setcolor <ain> hue=<0-359>&saturation=<0-255>&duration=<0-N>\n"\
+"setcolortemperature <ain> temperature=<2700-6500>&duration=<0-N>\ngetcolordefaults\n"\
+"sethkrboost <ain> endtimestamp=<unixtime>\nsethkrwindowopen <ain> endtimestamp=<unixtime>\n"\
+"setblind <ain> target=<open|close|stop>")
+SID_TIMEOUT=1200
+#----------------------------------------------------------------------------------------------------------
+#checks if sid exists and if it didn't timeout yet.
+function sidvalid() {
+  if [[ -e $sidfile ]]; then
+    timesid=$(stat -c %Y $sidfile)
+    timenow=$(date +%s)
+    timediff=$((timenow-timesid))
+    if [[ $timediff -lt $SID_TIMEOUT ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+#----------------------------------------------------------------------------------------------------------
+function login() {
+  if sidvalid; then return 0; fi #Don't log in if sid is still valid; the number of possible concurrent sessions is limited.
+ 
+  challenge=$(wget -q -O - "http://$IP/login_sid.lua" | sed 's/^.*<Challenge>\([[:alnum:]]\{8,8\}\).*$/\1/')
+  hashed=$(echo -n "$challenge-$2" | iconv -t utf-16le | md5sum | cut -d ' ' -f 1)
+
+  response=$(wget -q -O - "http://$IP/login_sid.lua?user=$1&response=${challenge}-$hashed")
+  result=$?
+
+  if [[ $result == 4 ]]; then
+    echo "Could not login due to network failure." 1>&2
+  elif [[ $result == 8 ]]; then
+    echo "Could not login due to server error response." 1>&2
+  elif [[ $result == 0 ]]; then
+    sid=$(echo -n  $response | sed 's/^.*<SID>\([[:alnum:]]\{16,16\}\).*$/\1/')
+    if [[ $sid == "0000000000000000" ]]; then
+      echo "Could not login due to server rejection of login credentials." 1>&2
+    else 
+      touch $sidfile
+      chmod 600 $sidfile
+      echo -n $sid > $sidfile
+      echo "Session id obtained succesfully." 1>&2
+    fi
+  fi
+  return $result
+}
+#----------------------------------------------------------------------------------------------------------
+function logout() {
+  if [[ -e $sidfile ]]; then
+    sid=$(cat $sidfile)
+    wget -q -O - "http://$IP/login_sid.lua?sid=$sid&logout=1" &> /dev/null
+    rm $sidfile
+  else
+    echo "No active sesssion to logout from found." 1>&2
+  fi
+}
+#----------------------------------------------------------------------------------------------------------
+#$1: command, $2: ain (required for some cmd's), $3 (extra get params required for a few special cmd's)
+function command() {
+  if sidvalid; then
+    sid=$(cat $sidfile)
+    url="http://$IP/webservices/homeautoswitch.lua?switchcmd=$1&sid=$sid"
+    if [ -n "$2" ]; then
+      url="$url&ain=$2"
+    fi
+    if [ -n "$3" ]; then
+      url="$url&$3"
+    fi
+    if ! wget -q -O - $url; then
+      return wget --server-response -q -O - $url 2>&1 | grep HTTP 1>&2
+    fi
+  else
+    echo "No valid login session is active. Login first." 1>&2
+    return 1
+  fi
+}
+#----------------------------------------------------------------------------------------------------------
+function parsedevicelist() {
+  if ! which xmlstarlet &> /dev/null ; then
+    echo "The xmlstarlet tool is required to parse xml data response. Please install xmlstarlet first." 1>&2
+    return
+  fi
+  
+  command "getdevicelistinfos" | xmlstarlet sel -t -m "//device" \
+    -v "concat(translate(./@identifier,' ',''),'|',"./name",'*')" \
+    | tr '*' '\n' #ok, an asterisk in the name will admitedly break this
+}
+#----------------------------------------------------------------------------------------------------------
+function help() {
+  echo -e "./fritz-han [-u <user>] -p <password> [IP]                    : login\n"\
+          "            -d [IP]                                          : device list\n"\
+          "            -c <command> [-a <ain>] [-e <extra params>] [IP] : command\n"\
+          "            -o [IP]                                          : logout explicitly\n"\
+          "            -l                                               : list available commands\n"\
+          "-Modem IP address is optional. The name fritz.box will be used as default.\n"\
+          "-Session id after login is saved and valid for 20 min (timer is reset on each new subsequent command).\n"\
+          " Credentials are not required anymore within this interval, but if unsure can be passed on each call,\n"\
+          " in which case a new session id will be acquired only when necessary.\n"\
+          "-The device identifier number <ain> needs to be supplied only for commands targetting a specific device.\n"\
+          "-A few commands feature some specific extra parameters. Refer to available command list (-l) for details.\n"\
+          "-The command devicelistinfos outputs verbose xml. -d filters out the essentials: ain and name.\n"\
+          "-A greppable short version of a command (instead of full command) is allowed and will be 'autocompleted'." 1>&2
+  exit 1
+}
+#----------------------------------------------------------------------------------------------------------
+#if shorthand command was given, then autocomplete it if possible.
+function shortcmd() {
+  matches=$(echo -e $CMD_LIST | grep $command | wc -l)
+  if [[ "$matches" -eq "0" ]]; then
+    return 0
+  elif [[ "$matches" -eq "1" ]]; then
+    command=$(echo -e $CMD_LIST | grep $command | cut -d ' ' -f 1)
+  else
+    echo "Ambiguous shorthand command. Possible matches:" 1>&2
+    echo -e $CMD_LIST | grep $command 1>&2
+    exit 1
+  fi
+}
+#----------------------------------------------------------------------------------------------------------
+function getargs() {
+  if [[ -z "$1" ]]; then help; fi
+
+  while getopts ":u:p:c:a:e:ldo" opt; do
+    case ${opt} in
+      u ) username=$OPTARG
+          ;;
+      p ) password=$OPTARG
+          ;;
+      o ) logout
+          ;;
+      c ) command=$OPTARG
+          ;;
+      a ) ain=$OPTARG
+          ;;
+      e ) extra=$OPTARG
+          ;;
+      d ) command="parsedevicelist" #this is an 'internal' command so to say
+          ;;
+      l ) echo -e $CMD_LIST
+          exit 0
+          ;;
+      : ) echo "Option $OPTARG requires an argument" 1>&2
+          exit 1
+          ;;
+      * ) help
+          exit 0
+          ;;
+    esac
+  done
+  shift $((OPTIND -1))
+
+  if [[ -n "$1" ]]; then 
+    IP="$1"
+  fi
+}
+#===========================================================================================================
+
+getargs $*
+
+#login for sid if needed and credentials provided
+if [[ -n "$password" ]]; then
+  if ! login "$username" "$password"; then
+    exit 1
+  fi
+fi
+
+if [[ -n "$command" ]]; then
+  if [[ $command == "parsedevicelist" ]]; then
+    parsedevicelist
+  else 
+    shortcmd
+    if command "$command" "$ain" "$extra"; then
+      if [[ -e $sidfile ]]; then touch $sidfile; fi
+    else
+      echo "Command failed." 1>&2
+    fi
+  fi
+fi
